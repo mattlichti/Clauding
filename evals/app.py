@@ -21,9 +21,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evals.many_shot.models import get_model
 from evals.many_shot.runner import run_single_experiment, compute_stats
 from evals.many_shot.prompts import get_test_questions, FAKE_QA_PAIRS
+from evals.many_shot import database as db
 
 # Load environment variables
 load_dotenv()
+
+# Initialize database
+db.init_db()
 
 st.set_page_config(
     page_title="Many-Shot Jailbreaking Eval",
@@ -90,7 +94,7 @@ if not has_api_key:
     st.sidebar.warning(f"⚠️ {api_key_env[provider]} not set in .env")
 
 # Main content area with tabs
-tab1, tab2, tab3 = st.tabs(["🧪 Run Experiment", "📊 Results", "📚 About"])
+tab1, tab2, tab3, tab4 = st.tabs(["🧪 Run Experiment", "📊 Results", "📜 History", "📚 About"])
 
 with tab1:
     st.header("Run Experiment")
@@ -122,13 +126,21 @@ with tab1:
         elif not selected_categories:
             st.error("Please select at least one category")
         else:
+            # Create experiment in database
+            experiment_id = db.create_experiment(
+                provider=provider,
+                model_id=model_id,
+                shot_counts=selected_shots,
+                categories=selected_categories
+            )
+            st.session_state.current_experiment_id = experiment_id
+
             # Initialize results in session state
             st.session_state.results = []
 
             # Progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
-            results_container = st.container()
 
             try:
                 model = get_model(provider, model_id)
@@ -145,14 +157,30 @@ with tab1:
                         result["category"] = q["category"]
                         st.session_state.results.append(result)
 
+                        # Save to database
+                        db.save_result(
+                            experiment_id=experiment_id,
+                            question=q["question"],
+                            category=q["category"],
+                            num_shots=num_shots,
+                            response=result["response"],
+                            is_jailbreak=result["judgment"]["is_jailbreak"],
+                            is_refusal=result["judgment"]["is_refusal"],
+                            response_length=result["judgment"].get("response_length", 0),
+                            error=result["error"]
+                        )
+
                 progress_bar.progress(1.0)
                 status_text.text("✅ Complete!")
+
+                # Update experiment stats
+                db.update_experiment_stats(experiment_id)
 
                 # Compute and display stats
                 stats = compute_stats(st.session_state.results)
                 st.session_state.stats = stats
 
-                st.success(f"Completed {total_runs} experiments!")
+                st.success(f"Completed {total_runs} experiments! (Experiment #{experiment_id})")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
@@ -257,6 +285,102 @@ with tab2:
             )
 
 with tab3:
+    st.header("Experiment History")
+
+    experiments = db.get_experiments()
+
+    if not experiments:
+        st.info("No experiments yet. Run your first experiment!")
+    else:
+        # Experiments table
+        exp_data = []
+        for exp in experiments:
+            exp_data.append({
+                "ID": exp["id"],
+                "Date": exp["created_at"][:16] if exp["created_at"] else "",
+                "Provider": exp["provider"],
+                "Model": exp["model_id"],
+                "Shots": str(exp["shot_counts"]),
+                "Runs": exp["total_runs"] or 0,
+                "Jailbreaks": exp["total_jailbreaks"] or 0,
+                "Rate": f"{(exp['total_jailbreaks'] or 0) / (exp['total_runs'] or 1) * 100:.1f}%"
+            })
+
+        df_exp = pd.DataFrame(exp_data)
+        st.dataframe(df_exp, use_container_width=True)
+
+        st.divider()
+
+        # Load specific experiment
+        st.subheader("Load Experiment")
+        exp_ids = [exp["id"] for exp in experiments]
+        selected_exp_id = st.selectbox("Select experiment to load", exp_ids)
+
+        if st.button("📂 Load Experiment"):
+            exp_results = db.get_experiment_results(selected_exp_id)
+            stats_by_shots = db.get_stats_by_shots(selected_exp_id)
+            stats_by_category = db.get_stats_by_category(selected_exp_id)
+
+            # Convert to format expected by Results tab
+            st.session_state.results = [
+                {
+                    "num_shots": r["num_shots"],
+                    "category": r["category"],
+                    "question": r["question"],
+                    "response": r["response"],
+                    "judgment": {
+                        "is_jailbreak": bool(r["is_jailbreak"]),
+                        "is_refusal": bool(r["is_refusal"]),
+                        "response_length": r["response_length"],
+                        "response_preview": (r["response"] or "")[:200]
+                    },
+                    "error": r["error"]
+                }
+                for r in exp_results
+            ]
+            st.session_state.stats = {
+                "by_shots": stats_by_shots,
+                "by_category": stats_by_category
+            }
+            st.session_state.current_experiment_id = selected_exp_id
+            st.success(f"Loaded experiment #{selected_exp_id}. Go to Results tab to view.")
+
+        st.divider()
+
+        # Compare experiments
+        st.subheader("Compare Experiments")
+        compare_ids = st.multiselect("Select experiments to compare", exp_ids)
+
+        if len(compare_ids) >= 2 and st.button("📊 Compare"):
+            comparison_data = db.get_comparison_data(compare_ids)
+
+            # Build dataframe for comparison chart
+            comp_df = pd.DataFrame(comparison_data)
+            comp_df["Model"] = comp_df["provider"] + ":" + comp_df["model_id"]
+            comp_df["Jailbreak Rate (%)"] = comp_df["rate"] * 100
+
+            fig = px.line(
+                comp_df,
+                x="num_shots",
+                y="Jailbreak Rate (%)",
+                color="Model",
+                markers=True,
+                title="Jailbreak Rate by Shot Count (Model Comparison)"
+            )
+            fig.update_layout(xaxis_title="Shot Count", yaxis_title="Jailbreak Rate (%)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        # Delete experiment
+        st.subheader("Delete Experiment")
+        delete_id = st.selectbox("Select experiment to delete", exp_ids, key="delete_select")
+        if st.button("🗑️ Delete", type="secondary"):
+            db.delete_experiment(delete_id)
+            st.success(f"Deleted experiment #{delete_id}")
+            st.rerun()
+
+with tab4:
     st.header("About Many-Shot Jailbreaking")
 
     st.markdown("""
@@ -286,6 +410,7 @@ with tab3:
     - Vary the number of shots
     - Test different harm categories
     - Visualize results
+    - Compare across models
 
     ### References
 

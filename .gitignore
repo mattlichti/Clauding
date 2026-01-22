@@ -3,6 +3,7 @@
 
 # Eval results
 evals/results/
+evals/*.db
 
 # Virtual environment
 .venv/
